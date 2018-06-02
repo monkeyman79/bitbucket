@@ -21,6 +21,7 @@
 #include "../../SDL_internal.h"
 
 #include "SDL_evdev_kbd.h"
+#include "SDL_hints.h"
 
 #ifdef SDL_INPUT_LINUXKD
 
@@ -194,8 +195,8 @@ static int SDL_EVDEV_kbd_load_keymaps(SDL_EVDEV_keyboard_state *kbd)
 }
 
 static SDL_EVDEV_keyboard_state * kbd_cleanup_state = NULL;
-
-static int kbd_cleanup_handlers_installed = 0;
+static int kbd_cleanup_sigactions_installed = 0;
+static int kbd_cleanup_atexit_installed = 0;
 
 static struct sigaction old_sigaction[NSIG] = { 0 };
 
@@ -215,7 +216,7 @@ static void kbd_cleanup(void)
     }
     kbd_cleanup_state = NULL;
 
-    fprintf(stderr, "SDL restoring keyboard\n");
+    fprintf(stderr, "(SDL restoring keyboard) ");
     ioctl(kbd->console_fd, KDSKBMODE, kbd->old_kbd_mode);
 }
 
@@ -252,6 +253,46 @@ static void kbd_cleanup_signal_action(int signum, siginfo_t* info, void* ucontex
     SDL_EVDEV_kbd_reraise_signal(signum);
 }
 
+static void kbd_unregister_emerg_cleanup()
+{
+    int tabidx, signum;
+
+    kbd_cleanup_state = NULL;
+
+    if (!kbd_cleanup_sigactions_installed) {
+        return;
+    }
+    kbd_cleanup_sigactions_installed = 0;
+
+    for (tabidx = 0; tabidx < sizeof(fatal_signals) / sizeof(fatal_signals[0]); ++tabidx) {
+        struct sigaction* old_action_p;
+        struct sigaction cur_action;
+        signum = fatal_signals[tabidx];
+        old_action_p = &(old_sigaction[signum]);
+
+        /* Examine current signal action */
+        if (sigaction(signum, NULL, &cur_action))
+            continue;
+
+        /* Check if action installed and not modifed */
+        if (!(cur_action.sa_flags & SA_SIGINFO)
+                || cur_action.sa_sigaction != &kbd_cleanup_signal_action)
+            continue;
+
+        /* Restore original action */
+        sigaction(signum, old_action_p, NULL);
+    }
+}
+
+static void kbd_cleanup_atexit(void)
+{
+    /* Restore keyboard. */
+    kbd_cleanup();
+
+    /* Try to restore signal handlers in case shared library is being unloaded */
+    kbd_unregister_emerg_cleanup();
+}
+
 static void kbd_register_emerg_cleanup(SDL_EVDEV_keyboard_state * kbd)
 {
     int tabidx, signum;
@@ -261,15 +302,19 @@ static void kbd_register_emerg_cleanup(SDL_EVDEV_keyboard_state * kbd)
     }
     kbd_cleanup_state = kbd;
 
-    /* Install signal handler only once even if application calls SDL_Init and
-     * SDL_Quit sequence more than once.
-     */
-    if (kbd_cleanup_handlers_installed) {
+    if (!kbd_cleanup_atexit_installed) {
+        /* Since glibc 2.2.3, atexit() (and on_exit(3)) can be used within a shared library to establish
+         * functions that are called when the shared library is unloaded.
+         * -- man atexit(3)
+         */
+        atexit(kbd_cleanup_atexit);
+        kbd_cleanup_atexit_installed = 1;
+    }
+
+    if (kbd_cleanup_sigactions_installed) {
         return;
     }
-    kbd_cleanup_handlers_installed = 1;
-
-    atexit(kbd_cleanup);
+    kbd_cleanup_sigactions_installed = 1;
 
     for (tabidx = 0; tabidx < sizeof(fatal_signals) / sizeof(fatal_signals[0]); ++tabidx) {
         struct sigaction* old_action_p;
@@ -292,15 +337,6 @@ static void kbd_register_emerg_cleanup(SDL_EVDEV_keyboard_state * kbd)
         new_action.sa_sigaction = &kbd_cleanup_signal_action;
         sigaction(signum, &new_action, NULL);
     }
-}
-
-static void kbd_unregister_emerg_cleanup(SDL_EVDEV_keyboard_state * kbd)
-{
-    if (kbd != kbd_cleanup_state) {
-        return;
-    }
-
-    kbd_cleanup_state = NULL;
 }
 
 SDL_EVDEV_keyboard_state *
@@ -350,6 +386,7 @@ SDL_EVDEV_kbd_init(void)
             kbd->key_maps = default_key_maps;
         }
 
+        /* Allow inhibiting keyboard mute with env. variable for debugging etc. */
         if (getenv("SDL_INPUT_LINUX_KEEP_KBD") == NULL) {
             /* Mute the keyboard so keystrokes only generate evdev events
              * and do not leak through to the console
@@ -359,7 +396,9 @@ SDL_EVDEV_kbd_init(void)
             /* Make sure to restore keyboard if application fails to call
              * SDL_Quit before exit or fatal signal is raised.
              */
-            kbd_register_emerg_cleanup(kbd);
+            if (!SDL_GetHintBoolean(SDL_HINT_NO_SIGNAL_HANDLERS, SDL_FALSE)) {
+                kbd_register_emerg_cleanup(kbd);
+            }
         }
     }
 
@@ -379,7 +418,7 @@ SDL_EVDEV_kbd_quit(SDL_EVDEV_keyboard_state *kbd)
         return;
     }
 
-    kbd_unregister_emerg_cleanup(kbd);
+    kbd_unregister_emerg_cleanup();
 
     if (kbd->console_fd >= 0) {
         /* Restore the original keyboard mode */
