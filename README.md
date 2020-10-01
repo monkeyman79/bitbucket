@@ -1,4 +1,7 @@
 # sdl-fixes
+
+**This code has been incorporated into SDL in release 2.0.9. It remains here for display and vanity purposes.**
+
 Fix SDL Linux evdev leaving keyboard dead after nonclean application exit.
 
 In SDL release 2.0.6, when Linux evdev keyboard support has been moved to a separate source file, a feature was added to disable normal keyboard event processing, to prevent "spilling" keystrokes to background virtual console.
